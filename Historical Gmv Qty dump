@@ -1,0 +1,94 @@
+
+WITH date_range AS (
+  SELECT
+    DATE '2026-10-01' AS start_date,
+    DATE '2026-10-22' AS end_date
+),
+
+base AS (
+  SELECT
+    DATE(oo.create_date, 'Asia/Kolkata') AS order_date,
+    nt.division AS division,
+    COALESCE(pb.name, 'NA') AS brand,
+    nt.category AS category,
+    nt.article_type AS article_type,
+    pt.gender AS gender,
+    pp.sku AS sku,
+    SAFE_CAST(oi.quantity AS NUMERIC) AS quantity,
+    SAFE_CAST(oi.sp AS NUMERIC) AS sp_num,
+    SAFE_CAST(oi.mrp AS NUMERIC) AS mrp_num
+
+  FROM `slikk-prod.slikkprodpublic.order_order` oo
+
+  JOIN `slikk-prod.slikkprodpublic.order_orderitem` oi
+    ON oo.id = oi.order_id
+
+  JOIN `slikk-prod.slikkprodpublic.product_product` pp
+    ON pp.id = oi.product_id
+
+  JOIN `slikk-prod.slikkprodpublic.product_brand` pb
+    ON pb.id = pp.brand_id
+
+  JOIN `slikk-prod.slikksilver.product_tags` pt
+    ON pt.product_id = pp.id
+
+  LEFT JOIN `slikk-prod.slikkanalytics.silver_new_product_tags` nt
+    ON nt.product_id = pp.id
+
+  CROSS JOIN date_range d
+
+  WHERE
+    oo.status NOT IN ('OPEN', 'FAILED')
+    AND oo.delivery_type != 'EXCHANGE'
+    AND DATE(oo.create_date, 'Asia/Kolkata')
+        BETWEEN d.start_date AND d.end_date
+)
+
+SELECT
+  CAST(order_date AS STRING) AS order_date,
+  division,
+  brand,
+  category,
+  article_type,
+  gender,
+  CAST(sku AS STRING) AS sku,
+
+  SUM(quantity) AS total_qty_sold,
+
+  ROUND(SUM(sp_num * quantity), 2) AS total_gmv,
+
+  ROUND(
+    SAFE_DIVIDE(
+      SUM(sp_num * quantity),
+      SUM(quantity)
+    ),
+    2
+  ) AS asp,
+
+  ROUND(
+    (
+      1 - SAFE_DIVIDE(
+        SUM(sp_num * quantity),
+        SUM(mrp_num * quantity)
+      )
+    ) * 100,
+    2
+  ) AS td_percent
+
+FROM base
+
+GROUP BY
+  order_date,
+  division,
+  brand,
+  category,
+  article_type,
+  gender,
+  sku
+
+ORDER BY
+  order_date,
+  division,
+  brand,
+  category,
+  sku;

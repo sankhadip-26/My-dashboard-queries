@@ -1,0 +1,435 @@
+const PROJECT_ID = 'slikk-prod';
+const SPREADSHEET_ID = '1-cu5NEo4r-9AzbvMGQcUszWsDBO7Y7YvF8Etoo6yXZ4';
+const SHEET_NAME = 'Oct Dump';
+const TIME_ZONE = 'Asia/Kolkata';
+
+const HEADERS = [
+  'order_date',
+  'division',
+  'brand',
+  'category',
+  'article_type',
+  'gender',
+  'sku',
+  'total_qty_sold',
+  'total_gmv',
+  'asp',
+  'td_percent',
+  'row_key'
+];
+
+/**
+ * Fetch aggregated data for the last 3 completed days.
+ * Date range: today - 3 days through yesterday, IST.
+ */
+function getBigQueryRows_() {
+  const sql = `
+    WITH base AS (
+      SELECT
+        DATE(oo.create_date, 'Asia/Kolkata') AS order_date,
+        nt.division AS division,
+        COALESCE(pb.name, 'NA') AS brand,
+        nt.category AS category,
+        nt.article_type AS article_type,
+        pt.gender AS gender,
+        pp.sku AS sku,
+        SAFE_CAST(oi.quantity AS NUMERIC) AS quantity,
+        SAFE_CAST(oi.sp AS NUMERIC) AS sp_num,
+        SAFE_CAST(oi.mrp AS NUMERIC) AS mrp_num
+
+      FROM \`slikk-prod.slikkprodpublic.order_order\` oo
+
+      JOIN \`slikk-prod.slikkprodpublic.order_orderitem\` oi
+        ON oo.id = oi.order_id
+
+      JOIN \`slikk-prod.slikkprodpublic.product_product\` pp
+        ON pp.id = oi.product_id
+
+      JOIN \`slikk-prod.slikkprodpublic.product_brand\` pb
+        ON pb.id = pp.brand_id
+
+      JOIN \`slikk-prod.slikksilver.product_tags\` pt
+        ON pt.product_id = pp.id
+
+      LEFT JOIN \`slikk-prod.slikkanalytics.silver_new_product_tags\` nt
+        ON nt.product_id = pp.id
+
+      WHERE
+        oo.status NOT IN ('OPEN', 'FAILED')
+        AND oo.delivery_type != 'EXCHANGE'
+        AND DATE(oo.create_date, 'Asia/Kolkata')
+            BETWEEN DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 3 DAY)
+                AND DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 1 DAY)
+    )
+
+    SELECT
+      CAST(order_date AS STRING) AS order_date,
+      division,
+      brand,
+      category,
+      article_type,
+      gender,
+      CAST(sku AS STRING) AS sku,
+
+      SUM(quantity) AS total_qty_sold,
+
+      ROUND(
+        SUM(sp_num * quantity),
+        2
+      ) AS total_gmv,
+
+      ROUND(
+        SAFE_DIVIDE(
+          SUM(sp_num * quantity),
+          SUM(quantity)
+        ),
+        2
+      ) AS asp,
+
+      ROUND(
+        (
+          1 - SAFE_DIVIDE(
+            SUM(sp_num * quantity),
+            SUM(mrp_num * quantity)
+          )
+        ) * 100,
+        2
+      ) AS td_percent
+
+    FROM base
+
+    GROUP BY
+      order_date,
+      division,
+      brand,
+      category,
+      article_type,
+      gender,
+      sku
+
+    ORDER BY
+      order_date,
+      division,
+      brand,
+      category,
+      sku
+  `;
+
+  let result = BigQuery.Jobs.query(
+    {
+      query: sql,
+      useLegacySql: false,
+      timeoutMs: 100000
+    },
+    PROJECT_ID
+  );
+
+  const jobId = result.jobReference.jobId;
+  const location = result.jobReference.location;
+
+  while (!result.jobComplete) {
+    Utilities.sleep(500);
+
+    result = BigQuery.Jobs.getQueryResults(
+      PROJECT_ID,
+      jobId,
+      {
+        location: location,
+        timeoutMs: 100000
+      }
+    );
+  }
+
+  const output = [];
+
+  while (true) {
+    if (result.rows) {
+      result.rows.forEach(r => {
+        output.push(
+          r.f.map(cell =>
+            cell.v === null ? '' : cell.v
+          )
+        );
+      });
+    }
+
+    if (!result.pageToken) break;
+
+    result = BigQuery.Jobs.getQueryResults(
+      PROJECT_ID,
+      jobId,
+      {
+        location: location,
+        pageToken: result.pageToken,
+        maxResults: 10000
+      }
+    );
+  }
+
+  return output;
+}
+
+/**
+ * Normalize dates for consistent matching.
+ */
+function normalizeDate_(value) {
+  if (value instanceof Date) {
+    return Utilities.formatDate(
+      value,
+      TIME_ZONE,
+      'yyyy-MM-dd'
+    );
+  }
+
+  return String(value || '').trim().slice(0, 10);
+}
+
+/**
+ * Build a composite key from columns A:G.
+ */
+function makeKey_(row) {
+  return JSON.stringify(
+    row.slice(0, 7).map((value, index) => {
+      if (value === null || value === undefined || value === '') {
+        return '';
+      }
+
+      if (index === 0) {
+        return normalizeDate_(value);
+      }
+
+      return String(value).trim();
+    })
+  );
+}
+
+/**
+ * Normalize cells before comparing metrics.
+ */
+function normalizeCell_(value, index) {
+  if (value === null || value === undefined || value === '') {
+    return '';
+  }
+
+  if (index === 0) {
+    return normalizeDate_(value);
+  }
+
+  if (index >= 7 && index <= 10) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : '';
+  }
+
+  return String(value).trim();
+}
+
+/**
+ * Compare report values in columns A:K.
+ * The technical key in L is not part of the comparison.
+ */
+function rowsEqual_(oldRow, newRow) {
+  for (let i = 0; i < 11; i++) {
+    if (
+      normalizeCell_(oldRow[i], i) !==
+      normalizeCell_(newRow[i], i)
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Daily sync into the existing Oct Dump tab.
+ *
+ * - Backfills row_key for existing historical rows.
+ * - Updates changed rows within the rolling 3-day window.
+ * - Appends new combinations.
+ * - Removes obsolete combinations within the window.
+ * - Preserves dates outside the window.
+ */
+function syncLast3Days() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    const spreadsheet =
+      SpreadsheetApp.openById(SPREADSHEET_ID);
+
+    const sheet = spreadsheet.getSheetByName(SHEET_NAME);
+
+    if (!sheet) {
+      throw new Error('Sheet not found: ' + SHEET_NAME);
+    }
+
+    // Ensure column L exists.
+    if (sheet.getMaxColumns() < 12) {
+      sheet.insertColumnsAfter(
+        sheet.getMaxColumns(),
+        12 - sheet.getMaxColumns()
+      );
+    }
+
+    // Add the technical header without changing A:K.
+    sheet.getRange(1, 12).setValue('row_key');
+
+    // Calculate the last 3 completed dates in IST.
+    const today = Utilities.formatDate(
+      new Date(),
+      TIME_ZONE,
+      'yyyy-MM-dd'
+    );
+
+    const endDate = new Date(today + 'T00:00:00Z');
+    endDate.setUTCDate(endDate.getUTCDate() - 1);
+
+    const startDate = new Date(endDate);
+    startDate.setUTCDate(startDate.getUTCDate() - 2);
+
+    const start = startDate.toISOString().slice(0, 10);
+    const end = endDate.toISOString().slice(0, 10);
+
+    const lastRow = sheet.getLastRow();
+
+    const existing = lastRow >= 2
+      ? sheet.getRange(
+          2, 1, lastRow - 1, 12
+        ).getValues()
+      : [];
+
+    // Backfill keys for all existing historical rows.
+    // Blank rows are left without a key.
+    const keyValues = existing.map(row => {
+      const hasData = row
+        .slice(0, 11)
+        .some(value => value !== '' && value !== null);
+
+      const key = hasData ? makeKey_(row) : '';
+      row[11] = key;
+
+      return [key];
+    });
+
+    if (keyValues.length > 0) {
+      sheet.getRange(
+        2, 12, keyValues.length, 1
+      ).setValues(keyValues);
+    }
+
+    // Fetch fresh BigQuery data.
+    const freshData = getBigQueryRows_();
+
+    // Safety check: don't delete existing data if the query
+    // unexpectedly returns no rows. Verify the query separately.
+    if (freshData.length === 0) {
+      console.log(
+        'BigQuery returned zero rows. No report rows were changed.'
+      );
+      sheet.hideColumns(12);
+      return;
+    }
+
+    const freshByKey = new Map();
+
+    freshData.forEach(row => {
+      const fullRow = [...row, makeKey_(row)];
+      freshByKey.set(fullRow[11], fullRow);
+    });
+
+    const updates = [];
+    const deleteRows = [];
+
+    existing.forEach((row, index) => {
+      const date = normalizeDate_(row[0]);
+
+      // Do not modify historical dates outside the window.
+      if (!date || date < start || date > end) {
+        return;
+      }
+
+      const key = row[11];
+
+      if (!freshByKey.has(key)) {
+        // This combination disappeared from the refreshed results.
+        deleteRows.push(index + 2);
+      } else {
+        const freshRow = freshByKey.get(key);
+
+        if (!rowsEqual_(row, freshRow)) {
+          updates.push({
+            rowNumber: index + 2,
+            values: freshRow
+          });
+        }
+
+        // This existing combination has been matched.
+        freshByKey.delete(key);
+      }
+    });
+
+    // Update only rows whose report values changed.
+    updates.forEach(item => {
+      sheet.getRange(
+        item.rowNumber, 1, 1, 12
+      ).setValues([item.values]);
+    });
+
+    // Remove obsolete rows, bottom to top.
+    deleteRows
+      .sort((a, b) => b - a)
+      .forEach(rowNumber => {
+        sheet.deleteRow(rowNumber);
+      });
+
+    // Append only combinations not already in the sheet.
+    const appends = Array.from(freshByKey.values());
+
+    if (appends.length > 0) {
+      const firstRow = sheet.getLastRow() + 1;
+
+      // Keep SKU values as text.
+      sheet.getRange(
+        firstRow, 7, appends.length, 1
+      ).setNumberFormat('@');
+
+      sheet.getRange(
+        firstRow, 1, appends.length, 12
+      ).setValues(appends);
+    }
+
+    // Hide the technical key column.
+    sheet.hideColumns(12);
+
+    console.log(
+      'Sync completed. Updated: ' + updates.length +
+      ', removed: ' + deleteRows.length +
+      ', appended: ' + appends.length
+    );
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Run once to create the daily trigger.
+ * Runs around 5 AM in Asia/Kolkata.
+ */
+function createDailyTrigger() {
+  ScriptApp.getProjectTriggers()
+    .filter(
+      trigger =>
+        trigger.getHandlerFunction() === 'syncLast3Days'
+    )
+    .forEach(trigger => {
+      ScriptApp.deleteTrigger(trigger);
+    });
+
+  ScriptApp.newTrigger('syncLast3Days')
+    .timeBased()
+    .everyDays(1)
+    .atHour(5)
+    .inTimezone(TIME_ZONE)
+    .create();
+}

@@ -1,0 +1,130 @@
+
+WITH date_range AS (
+  SELECT
+    DATE '2026-10-01' AS start_date,
+    DATE '2026-10-22' AS end_date
+),
+
+return_qty AS (
+  SELECT
+    order_item_id,
+    SUM(return_qty) AS return_quantity
+  FROM (
+    SELECT
+      roi.order_item_id,
+
+      CASE
+        WHEN ro.status NOT IN (
+          'OPEN', 'ACCEPTED', 'CANCELLED', 'DELIVERY_CANCELLED',
+          'PICKUP_CANCELLED', 'RETURN_CANCELLED', 'RETURN_REJECTED',
+          'ATTEMPT_FAILED'
+        )
+        AND oo.status IN (
+          'COMPLETED', 'PACKED', 'SHIPPED',
+          'OUT_FOR_DELIVERY', 'ACCEPTED'
+        )
+        THEN SAFE_CAST(roi.quantity AS NUMERIC)
+      END AS return_qty,
+
+      ROW_NUMBER() OVER (
+        PARTITION BY
+          roi.order_item_id,
+          CASE
+            WHEN oo.status = 'CANCELLED' THEN 'FIXED'
+            ELSE CAST(ro.id AS STRING)
+          END
+        ORDER BY ro.create_date ASC
+      ) AS rn
+
+    FROM `slikk-prod.slikkprodpublic.order_returnorderitem` roi
+
+    JOIN `slikk-prod.slikkprodpublic.order_returnorder` ro
+      ON roi.return_order_id = ro.id
+
+    JOIN `slikk-prod.slikkprodpublic.order_orderitem` oi
+      ON oi.id = roi.order_item_id
+
+    JOIN `slikk-prod.slikkprodpublic.order_order` oo
+      ON oo.id = oi.order_id
+
+    WHERE oo.delivery_type != 'EXCHANGE'
+      AND LOWER(ro.return_type) NOT LIKE '%exchange%'
+  )
+  WHERE rn = 1
+  GROUP BY order_item_id
+),
+
+base AS (
+  SELECT
+    DATE(oo.create_date, 'Asia/Kolkata') AS order_date,
+    nt.division AS division,
+    pb.name AS brand,
+
+    GREATEST(
+      CASE
+        WHEN oo.status NOT IN (
+          'CANCELLED', 'DECLINED', 'RTO_CANCELLED',
+          'RTO_DELIVERED', 'RTO_INITIATED'
+        )
+        THEN COALESCE(
+          SAFE_CAST(oi.fulfilled_quantity AS NUMERIC),
+          0
+        )
+        ELSE 0
+      END
+      - COALESCE(rq.return_quantity, 0),
+      0
+    ) AS net_qty_sold,
+
+    SAFE_CAST(oi.brand_offer_sp AS NUMERIC) AS brand_offer_sp,
+    SAFE_CAST(oi.sp AS NUMERIC) AS sp
+
+  FROM `slikk-prod.slikkprodpublic.order_order` oo
+
+  JOIN `slikk-prod.slikkprodpublic.store_store` ss
+    ON oo.store_id = ss.id
+
+  JOIN `slikk-prod.slikkprodpublic.order_orderitem` oi
+    ON oo.id = oi.order_id
+
+  JOIN `slikk-prod.slikkprodpublic.product_product` pp
+    ON pp.id = oi.product_id
+
+  JOIN `slikk-prod.slikkprodpublic.product_brand` pb
+    ON pb.id = pp.brand_id
+
+  JOIN `slikk-prod.slikksilver.product_tags` pt
+    ON pt.product_id = pp.id
+
+  LEFT JOIN `slikk-prod.slikkanalytics.silver_new_product_tags` nt
+    ON nt.product_id = pp.id
+
+  LEFT JOIN return_qty rq
+    ON rq.order_item_id = oi.id
+
+  CROSS JOIN date_range d
+
+  WHERE oo.status NOT IN ('OPEN', 'FAILED')
+    AND oo.delivery_type != 'EXCHANGE'
+    AND DATE(oo.create_date, 'Asia/Kolkata')
+        BETWEEN d.start_date AND d.end_date
+)
+
+SELECT
+  CAST(order_date AS STRING) AS order_date,
+  division,
+  brand,
+  SUM(net_qty_sold) AS net_qty_sold,
+  SUM((brand_offer_sp - sp) * net_qty_sold) AS burn
+
+FROM base
+
+GROUP BY
+  order_date,
+  division,
+  brand
+
+ORDER BY
+  order_date ASC,
+  division ASC,
+  brand ASC;

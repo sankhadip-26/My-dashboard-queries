@@ -1,0 +1,85 @@
+WITH raw_events AS (
+  SELECT
+    DATE(create_date, 'Asia/Kolkata') AS event_date,
+    REPLACE(
+      REGEXP_EXTRACT(api, r'/product/([^/?]+)'),
+      '%20',
+      ' '
+    ) AS barcode
+  FROM `slikk-prod.slikkprodUT.public_authentication_usertracking`
+  WHERE device IS NOT NULL
+    AND api LIKE '/product/%'
+    AND DATE(create_date, 'Asia/Kolkata')
+        = DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 1 DAY)
+),
+
+enriched_events AS (
+  SELECT
+    e.event_date,
+    pt.category,
+    pt.fashion_style,
+    pt.subcategory,
+
+    CASE
+      WHEN LOWER(pt.subcategory) IN ('belts', 'wallets')
+        THEN 'belts_wallets'
+
+      WHEN LOWER(pt.subcategory) IN (
+        'bags & backpacks',
+        'duffel bags',
+        'rucksacks',
+        'sling & crossbody'
+      )
+        THEN 'bags'
+
+      ELSE pt.subcategory
+    END AS subcategory_group
+
+  FROM raw_events e
+  JOIN `slikk-prod.slikkprodpublic.product_product` p
+    ON p.barcode = e.barcode
+    OR p.skid = e.barcode
+  JOIN `slikk-prod.slikksilver.product_tags` pt
+    ON pt.product_id = p.id
+)
+
+SELECT
+  event_date,
+
+  COUNTIF(LOWER(subcategory_group) = 'bags')
+    AS backpacks,
+
+  COUNTIF(LOWER(subcategory_group) = 'belts_wallets')
+    AS belts_and_wallets,
+
+  COUNTIF(LOWER(subcategory) = 'handbags & wallets')
+    AS handbags,
+
+  COUNTIF(LOWER(fashion_style) = 'home & living')
+    AS home,
+
+  COUNTIF(LOWER(category) LIKE '%jewellery%')
+    AS jewellery,
+
+  COUNTIF(LOWER(subcategory) = 'trolley bags')
+    AS trolley,
+
+  COUNTIF(LOWER(fashion_style) = 'footwear')
+    AS footwear,
+
+  COUNTIF(LOWER(subcategory) = 'eyewear')
+    AS eyewear,
+
+  COUNTIF(LOWER(fashion_style) = 'ethnic')
+    AS ethnic,
+
+  COUNTIF(LOWER(fashion_style) = 'western')
+    AS western,
+
+  COUNTIF(LOWER(fashion_style) = 'beauty')
+    AS beauty,
+
+  COUNT(*) AS platform
+
+FROM enriched_events
+GROUP BY event_date;

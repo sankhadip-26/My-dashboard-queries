@@ -1,0 +1,430 @@
+
+const BURN_PROJECT_ID = 'slikk-prod';
+const BURN_SPREADSHEET_ID = '1-cu5NEo4r-9AzbvMGQcUszWsDBO7Y7YvF8Etoo6yXZ4';
+const BURN_SHEET_NAME = 'Burn Dump';
+const BURN_TIME_ZONE = 'Asia/Kolkata';
+
+const BURN_HEADERS = [
+  'order_date',
+  'division',
+  'brand',
+  'net_qty_sold',
+  'burn',
+  'row_key'
+];
+
+/**
+ * Fetch grouped burn data for the last 3 completed days.
+ * Date range: today - 3 days through yesterday, IST.
+ */
+function getBurnBigQueryRows_() {
+  const sql = `
+    WITH date_range AS (
+      SELECT
+        DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 3 DAY) AS start_date,
+        DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 1 DAY) AS end_date
+    ),
+
+    return_qty AS (
+      SELECT
+        order_item_id,
+        SUM(return_qty) AS return_quantity
+      FROM (
+        SELECT
+          roi.order_item_id,
+          CASE
+            WHEN ro.status NOT IN (
+              'OPEN', 'ACCEPTED', 'CANCELLED', 'DELIVERY_CANCELLED',
+              'PICKUP_CANCELLED', 'RETURN_CANCELLED', 'RETURN_REJECTED',
+              'ATTEMPT_FAILED'
+            )
+            AND oo.status IN (
+              'COMPLETED', 'PACKED', 'SHIPPED',
+              'OUT_FOR_DELIVERY', 'ACCEPTED'
+            )
+            THEN SAFE_CAST(roi.quantity AS NUMERIC)
+          END AS return_qty,
+
+          ROW_NUMBER() OVER (
+            PARTITION BY
+              roi.order_item_id,
+              CASE
+                WHEN oo.status = 'CANCELLED' THEN 'FIXED'
+                ELSE CAST(ro.id AS STRING)
+              END
+            ORDER BY ro.create_date ASC
+          ) AS rn
+
+        FROM \`slikk-prod.slikkprodpublic.order_returnorderitem\` roi
+        JOIN \`slikk-prod.slikkprodpublic.order_returnorder\` ro
+          ON roi.return_order_id = ro.id
+        JOIN \`slikk-prod.slikkprodpublic.order_orderitem\` oi
+          ON oi.id = roi.order_item_id
+        JOIN \`slikk-prod.slikkprodpublic.order_order\` oo
+          ON oo.id = oi.order_id
+
+        WHERE oo.delivery_type != 'EXCHANGE'
+          AND LOWER(ro.return_type) NOT LIKE '%exchange%'
+      )
+      WHERE rn = 1
+      GROUP BY order_item_id
+    ),
+
+    base AS (
+      SELECT
+        DATE(oo.create_date, 'Asia/Kolkata') AS order_date,
+        nt.division AS division,
+        pb.name AS brand,
+
+        GREATEST(
+          CASE
+            WHEN oo.status NOT IN (
+              'CANCELLED', 'DECLINED', 'RTO_CANCELLED',
+              'RTO_DELIVERED', 'RTO_INITIATED'
+            )
+            THEN COALESCE(
+              SAFE_CAST(oi.fulfilled_quantity AS NUMERIC),
+              0
+            )
+            ELSE 0
+          END
+          - COALESCE(rq.return_quantity, 0),
+          0
+        ) AS net_qty_sold,
+
+        SAFE_CAST(oi.brand_offer_sp AS NUMERIC) AS brand_offer_sp,
+        SAFE_CAST(oi.sp AS NUMERIC) AS sp
+
+      FROM \`slikk-prod.slikkprodpublic.order_order\` oo
+
+      JOIN \`slikk-prod.slikkprodpublic.store_store\` ss
+        ON oo.store_id = ss.id
+      JOIN \`slikk-prod.slikkprodpublic.order_orderitem\` oi
+        ON oo.id = oi.order_id
+      JOIN \`slikk-prod.slikkprodpublic.product_product\` pp
+        ON pp.id = oi.product_id
+      JOIN \`slikk-prod.slikkprodpublic.product_brand\` pb
+        ON pb.id = pp.brand_id
+      JOIN \`slikk-prod.slikksilver.product_tags\` pt
+        ON pt.product_id = pp.id
+      LEFT JOIN \`slikk-prod.slikkanalytics.silver_new_product_tags\` nt
+        ON nt.product_id = pp.id
+      LEFT JOIN return_qty rq
+        ON rq.order_item_id = oi.id
+
+      WHERE oo.status NOT IN ('OPEN', 'FAILED')
+        AND oo.delivery_type != 'EXCHANGE'
+        AND DATE(oo.create_date, 'Asia/Kolkata')
+            BETWEEN (SELECT start_date FROM date_range)
+                AND (SELECT end_date FROM date_range)
+    )
+
+    SELECT
+      CAST(order_date AS STRING) AS order_date,
+      division,
+      brand,
+      SUM(net_qty_sold) AS net_qty_sold,
+      SUM((brand_offer_sp - sp) * net_qty_sold) AS burn
+
+    FROM base
+    GROUP BY order_date, division, brand
+    ORDER BY order_date ASC, division ASC, brand ASC
+  `;
+
+  let result = BigQuery.Jobs.query(
+    {
+      query: sql,
+      useLegacySql: false,
+      timeoutMs: 100000
+    },
+    BURN_PROJECT_ID
+  );
+
+  const jobId = result.jobReference.jobId;
+  const location = result.jobReference.location;
+
+  while (!result.jobComplete) {
+    Utilities.sleep(500);
+
+    result = BigQuery.Jobs.getQueryResults(
+      BURN_PROJECT_ID,
+      jobId,
+      {
+        location: location,
+        timeoutMs: 100000
+      }
+    );
+  }
+
+  const output = [];
+
+  while (true) {
+    if (result.rows) {
+      result.rows.forEach(r => {
+        output.push(
+          r.f.map(cell => cell.v === null ? '' : cell.v)
+        );
+      });
+    }
+
+    if (!result.pageToken) break;
+
+    result = BigQuery.Jobs.getQueryResults(
+      BURN_PROJECT_ID,
+      jobId,
+      {
+        location: location,
+        pageToken: result.pageToken,
+        maxResults: 10000
+      }
+    );
+  }
+
+  return output;
+}
+
+
+/** Normalize dates for consistent matching. */
+function normalizeBurnDate_(value) {
+  if (value instanceof Date) {
+    return Utilities.formatDate(
+      value,
+      BURN_TIME_ZONE,
+      'yyyy-MM-dd'
+    );
+  }
+
+  return String(value || '').trim().slice(0, 10);
+}
+
+
+/** Key: order_date + division + brand. */
+function makeBurnKey_(row) {
+  return JSON.stringify(
+    row.slice(0, 3).map((value, index) => {
+      if (value === null || value === undefined || value === '') {
+        return '';
+      }
+
+      return index === 0
+        ? normalizeBurnDate_(value)
+        : String(value).trim();
+    })
+  );
+}
+
+
+/** Normalize values before comparing rows. */
+function normalizeBurnCell_(value, index) {
+  if (value === null || value === undefined || value === '') {
+    return '';
+  }
+
+  if (index === 0) {
+    return normalizeBurnDate_(value);
+  }
+
+  if (index === 3 || index === 4) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : '';
+  }
+
+  return String(value).trim();
+}
+
+
+/** Compare report columns A:E, excluding row_key. */
+function burnRowsEqual_(oldRow, newRow) {
+  for (let i = 0; i < 5; i++) {
+    if (
+      normalizeBurnCell_(oldRow[i], i) !==
+      normalizeBurnCell_(newRow[i], i)
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+
+/**
+ * Sync Burn Dump:
+ * - Updates changed combinations in the last 3 completed days.
+ * - Appends new combinations.
+ * - Removes obsolete combinations within those dates.
+ * - Preserves historical dates outside the window.
+ */
+function syncBurnDumpLast3Days() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    const spreadsheet = SpreadsheetApp.openById(
+      BURN_SPREADSHEET_ID
+    );
+
+    const sheet = spreadsheet.getSheetByName(
+      BURN_SHEET_NAME
+    );
+
+    if (!sheet) {
+      throw new Error(
+        'Sheet not found: ' + BURN_SHEET_NAME
+      );
+    }
+
+    if (sheet.getMaxColumns() < 6) {
+      sheet.insertColumnsAfter(
+        sheet.getMaxColumns(),
+        6 - sheet.getMaxColumns()
+      );
+    }
+
+    // Set headers.
+    sheet.getRange(1, 1, 1, 5).setValues([
+      BURN_HEADERS.slice(0, 5)
+    ]);
+    sheet.getRange(1, 6).setValue('row_key');
+
+    // Last 3 completed dates in IST.
+    const today = Utilities.formatDate(
+      new Date(),
+      BURN_TIME_ZONE,
+      'yyyy-MM-dd'
+    );
+
+    const endDate = new Date(today + 'T00:00:00Z');
+    endDate.setUTCDate(endDate.getUTCDate() - 1);
+
+    const startDate = new Date(endDate);
+    startDate.setUTCDate(startDate.getUTCDate() - 2);
+
+    const start = startDate.toISOString().slice(0, 10);
+    const end = endDate.toISOString().slice(0, 10);
+
+    const lastRow = sheet.getLastRow();
+
+    const existing = lastRow >= 2
+      ? sheet.getRange(2, 1, lastRow - 1, 6).getValues()
+      : [];
+
+    // Backfill technical keys for existing rows.
+    const keyValues = existing.map(row => {
+      const hasData = row.slice(0, 5).some(
+        value => value !== '' && value !== null
+      );
+
+      const key = hasData ? makeBurnKey_(row) : '';
+      row[5] = key;
+      return [key];
+    });
+
+    if (keyValues.length > 0) {
+      sheet.getRange(2, 6, keyValues.length, 1)
+        .setValues(keyValues);
+    }
+
+    // Fetch fresh BigQuery data.
+    const freshData = getBurnBigQueryRows_();
+
+    // Fail-safe: do not delete report rows if query returns no data.
+    if (freshData.length === 0) {
+      console.log(
+        'BigQuery returned zero rows. No report rows were changed.'
+      );
+      sheet.hideColumns(6);
+      return;
+    }
+
+    const freshByKey = new Map();
+
+    freshData.forEach(row => {
+      const fullRow = [...row, makeBurnKey_(row)];
+      freshByKey.set(fullRow[5], fullRow);
+    });
+
+    const updates = [];
+    const deleteRows = [];
+
+    existing.forEach((row, index) => {
+      const date = normalizeBurnDate_(row[0]);
+
+      // Leave dates outside the rolling window unchanged.
+      if (!date || date < start || date > end) {
+        return;
+      }
+
+      const key = makeBurnKey_(row);
+
+      if (!freshByKey.has(key)) {
+        deleteRows.push(index + 2);
+      } else {
+        const freshRow = freshByKey.get(key);
+
+        if (!burnRowsEqual_(row, freshRow)) {
+          updates.push({
+            rowNumber: index + 2,
+            values: freshRow
+          });
+        }
+
+        freshByKey.delete(key);
+      }
+    });
+
+    // Update rows whose values changed.
+    updates.forEach(item => {
+      sheet.getRange(item.rowNumber, 1, 1, 6)
+        .setValues([item.values]);
+    });
+
+    // Delete obsolete rows from bottom to top.
+    deleteRows.sort((a, b) => b - a).forEach(rowNumber => {
+      sheet.deleteRow(rowNumber);
+    });
+
+    // Append new date + division + brand combinations.
+    const appends = Array.from(freshByKey.values());
+
+    if (appends.length > 0) {
+      const firstRow = sheet.getLastRow() + 1;
+
+      sheet.getRange(firstRow, 1, appends.length, 6)
+        .setValues(appends);
+    }
+
+    // Hide technical key column F.
+    sheet.hideColumns(6);
+
+    console.log(
+      'Burn Dump sync completed. ' +
+      'Updated: ' + updates.length +
+      ', removed: ' + deleteRows.length +
+      ', appended: ' + appends.length
+    );
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+/** Run once to create the daily trigger at around 5 AM IST. */
+function createBurnDumpDailyTrigger() {
+  ScriptApp.getProjectTriggers()
+    .filter(
+      trigger =>
+        trigger.getHandlerFunction() === 'syncBurnDumpLast3Days'
+    )
+    .forEach(trigger => {
+      ScriptApp.deleteTrigger(trigger);
+    });
+
+  ScriptApp.newTrigger('syncBurnDumpLast3Days')
+    .timeBased()
+    .everyDays(1)
+    .atHour(5)
+    .inTimezone(BURN_TIME_ZONE)
+    .create();
+}

@@ -1,0 +1,195 @@
+WITH date_range AS (
+  SELECT
+    DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 1 DAY) AS start_date,
+    DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 1 DAY) AS end_date
+),
+
+-- Keep one tag row per product to avoid multiplying order-item GMV
+product_tags AS (
+  SELECT
+    product_id,
+    ANY_VALUE(subcategory) AS subcategory
+  FROM `slikk-prod.slikksilver.product_tags`
+  GROUP BY product_id
+),
+
+new_product_tags AS (
+  SELECT
+    product_id,
+    ANY_VALUE(division) AS division
+  FROM `slikk-prod.slikkanalytics.silver_new_product_tags`
+  GROUP BY product_id
+),
+
+base AS (
+  SELECT
+    DATE(oo.create_date, 'Asia/Kolkata') AS order_date,
+    LOWER(TRIM(nt.division)) AS division,
+    LOWER(TRIM(pt.subcategory)) AS subcategory,
+    oi.sp * oi.quantity AS gmv,
+    oi.quantity AS quantity
+  FROM `slikk-prod.slikkprodpublic.order_order` oo
+  JOIN `slikk-prod.slikkprodpublic.order_orderitem` oi
+    ON oo.id = oi.order_id
+  LEFT JOIN product_tags pt
+    ON pt.product_id = oi.product_id
+  LEFT JOIN new_product_tags nt
+    ON nt.product_id = oi.product_id
+  WHERE oo.status NOT IN ('OPEN', 'FAILED')
+    AND oo.delivery_type != 'EXCHANGE'
+    AND DATE(oo.create_date, 'Asia/Kolkata')
+        BETWEEN (SELECT start_date FROM date_range)
+            AND (SELECT end_date FROM date_range)
+),
+
+mapped AS (
+  SELECT
+    order_date,
+    gmv,
+    quantity,
+    CASE
+      WHEN division = 'accessories'
+        AND subcategory IN ('belts', 'wallets')
+        THEN 'Belts & Wallets'
+
+      WHEN division = 'accessories'
+        AND subcategory IN ('trolley bags', 'umbrellas')
+        THEN 'Trolley'
+
+      WHEN division = 'accessories'
+        AND subcategory IN (
+          'bags & backpacks',
+          'duffel bags',
+          'sling & crossbody',
+          'rucksacks',
+          'neck pillows & eye masks',
+          'travel organisers',
+          'passport holders',
+          'organisers'
+        )
+        THEN 'Backpacks'
+
+      WHEN division = 'accessories'
+        AND subcategory = 'eyewear'
+        THEN 'Eyewear'
+
+      WHEN division = 'accessories'
+        AND subcategory IN (
+          'handbags & wallets',
+          'caps & hats',
+          'fashion accessories',
+          'na'
+        )
+        THEN 'Handbags'
+
+      WHEN division = 'home' THEN 'Home'
+      WHEN division = 'jewellery' THEN 'Jewellery'
+      WHEN division = 'footwear' THEN 'Footwear'
+      WHEN division = 'ethnic' THEN 'Ethnic'
+      WHEN division = 'beauty' THEN 'Beauty'
+      WHEN division = 'apparel' THEN 'Western'
+      ELSE 'Unmapped'
+    END AS category
+  FROM base
+),
+
+daily AS (
+  SELECT
+    order_date,
+
+    ROUND(SUM(IF(category = 'Backpacks', gmv, 0)) / 100000, 3)
+      AS GMV_Backpacks,
+    ROUND(SUM(IF(category = 'Belts & Wallets', gmv, 0)) / 100000, 3)
+      AS GMV_Belts_Wallets,
+    ROUND(SUM(IF(category = 'Handbags', gmv, 0)) / 100000, 3)
+      AS GMV_Handbags,
+    ROUND(SUM(IF(category = 'Home', gmv, 0)) / 100000, 3)
+      AS GMV_Home,
+    ROUND(SUM(IF(category = 'Jewellery', gmv, 0)) / 100000, 3)
+      AS GMV_Jewellery,
+    ROUND(SUM(IF(category = 'Trolley', gmv, 0)) / 100000, 3)
+      AS GMV_Trolley,
+    ROUND(SUM(IF(category = 'Footwear', gmv, 0)) / 100000, 3)
+      AS GMV_Footwear,
+    ROUND(SUM(IF(category = 'Eyewear', gmv, 0)) / 100000, 3)
+      AS GMV_Eyewear,
+    ROUND(SUM(IF(category = 'Ethnic', gmv, 0)) / 100000, 3)
+      AS GMV_Ethnic,
+    ROUND(SUM(IF(category = 'Western', gmv, 0)) / 100000, 3)
+      AS GMV_Western,
+    ROUND(SUM(IF(category = 'Beauty', gmv, 0)) / 100000, 3)
+      AS GMV_Beauty,
+
+    -- Full report total, including unmapped and untagged products
+    ROUND(SUM(gmv) / 100000, 3) AS GMV_Platform,
+
+    SUM(IF(category = 'Backpacks', quantity, 0)) AS Qty_Backpacks,
+    SUM(IF(category = 'Belts & Wallets', quantity, 0)) AS Qty_Belts_Wallets,
+    SUM(IF(category = 'Handbags', quantity, 0)) AS Qty_Handbags,
+    SUM(IF(category = 'Home', quantity, 0)) AS Qty_Home,
+    SUM(IF(category = 'Jewellery', quantity, 0)) AS Qty_Jewellery,
+    SUM(IF(category = 'Trolley', quantity, 0)) AS Qty_Trolley,
+    SUM(IF(category = 'Footwear', quantity, 0)) AS Qty_Footwear,
+    SUM(IF(category = 'Eyewear', quantity, 0)) AS Qty_Eyewear,
+    SUM(IF(category = 'Ethnic', quantity, 0)) AS Qty_Ethnic,
+    SUM(IF(category = 'Western', quantity, 0)) AS Qty_Western,
+    SUM(IF(category = 'Beauty', quantity, 0)) AS Qty_Beauty,
+
+    SUM(quantity) AS Qty_Platform
+
+  FROM mapped
+  GROUP BY order_date
+)
+
+SELECT
+  CAST(order_date AS STRING) AS order_date,
+  Backpacks,
+  `Belts & Wallets`,
+  Handbags,
+  Home,
+  Jewellery,
+  Trolley,
+  Footwear,
+  Eyewear,
+  Ethnic,
+  Western,
+  Beauty,
+  Platform
+FROM (
+  SELECT
+    1 AS section_order,
+    order_date,
+    GMV_Backpacks AS Backpacks,
+    GMV_Belts_Wallets AS `Belts & Wallets`,
+    GMV_Handbags AS Handbags,
+    GMV_Home AS Home,
+    GMV_Jewellery AS Jewellery,
+    GMV_Trolley AS Trolley,
+    GMV_Footwear AS Footwear,
+    GMV_Eyewear AS Eyewear,
+    GMV_Ethnic AS Ethnic,
+    GMV_Western AS Western,
+    GMV_Beauty AS Beauty,
+    GMV_Platform AS Platform
+  FROM daily
+
+  UNION ALL
+
+  SELECT
+    2 AS section_order,
+    order_date,
+    Qty_Backpacks AS Backpacks,
+    Qty_Belts_Wallets AS `Belts & Wallets`,
+    Qty_Handbags AS Handbags,
+    Qty_Home AS Home,
+    Qty_Jewellery AS Jewellery,
+    Qty_Trolley AS Trolley,
+    Qty_Footwear AS Footwear,
+    Qty_Eyewear AS Eyewear,
+    Qty_Ethnic AS Ethnic,
+    Qty_Western AS Western,
+    Qty_Beauty AS Beauty,
+    Qty_Platform AS Platform
+  FROM daily
+)
+ORDER BY section_order, order_date;

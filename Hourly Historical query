@@ -1,0 +1,94 @@
+
+WITH date_range AS (
+  SELECT
+    DATE_TRUNC(
+      DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 1 MONTH),
+      MONTH
+    ) AS start_date,
+    CURRENT_DATE('Asia/Kolkata') AS end_date
+),
+
+base AS (
+  SELECT
+    DATE(oo.create_date, 'Asia/Kolkata') AS order_date,
+
+    EXTRACT(
+      HOUR FROM DATETIME(oo.create_date, 'Asia/Kolkata')
+    ) AS order_hour,
+
+    nt.division AS division,
+    pb.name AS brand,
+
+    CASE
+      WHEN UPPER(TRIM(nt.division)) = 'APPAREL' THEN
+        COALESCE(
+          NULLIF(UPPER(TRIM(pt.gender)), ''),
+          'UNKNOWN'
+        )
+      ELSE 'ALL'
+    END AS gender,
+
+    SAFE_CAST(oi.quantity AS NUMERIC) AS quantity,
+    SAFE_CAST(oi.sp AS NUMERIC) AS sp,
+    SAFE_CAST(oi.brand_offer_sp AS NUMERIC) AS brand_offer_sp
+
+  FROM `slikk-prod.slikkprodpublic.order_order` oo
+
+  JOIN `slikk-prod.slikkprodpublic.order_orderitem` oi
+    ON oo.id = oi.order_id
+
+  JOIN `slikk-prod.slikkprodpublic.product_product` pp
+    ON pp.id = oi.product_id
+
+  JOIN `slikk-prod.slikkprodpublic.product_brand` pb
+    ON pb.id = pp.brand_id
+
+  JOIN `slikk-prod.slikksilver.product_tags` pt
+    ON pt.product_id = pp.id
+
+  LEFT JOIN `slikk-prod.slikkanalytics.silver_new_product_tags` nt
+    ON nt.product_id = pp.id
+
+  CROSS JOIN date_range d
+
+  WHERE
+    oo.status NOT IN ('OPEN', 'FAILED')
+    AND oo.delivery_type != 'EXCHANGE'
+    AND DATE(oo.create_date, 'Asia/Kolkata')
+        BETWEEN d.start_date AND d.end_date
+)
+
+SELECT
+  CAST(order_date AS STRING) AS order_date,
+  order_hour,
+  division,
+  brand,
+  gender,
+
+  SUM(quantity) AS total_qty,
+
+  ROUND(
+    SUM(sp * quantity),
+    2
+  ) AS gmv,
+
+  ROUND(
+    SUM((brand_offer_sp - sp) * quantity),
+    2
+  ) AS gross_burn
+
+FROM base
+
+GROUP BY
+  order_date,
+  order_hour,
+  division,
+  brand,
+  gender
+
+ORDER BY
+  order_date,
+  order_hour,
+  division,
+  brand,
+  gender;

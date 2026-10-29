@@ -12,7 +12,7 @@ base AS (
     COALESCE(pb.name, 'NA') AS brand,
     nt.category AS category,
     nt.article_type AS article_type,
-    pt.gender AS gender,
+    nt.gender AS gender,
     pp.sku AS sku,
     SAFE_CAST(oi.quantity AS NUMERIC) AS quantity,
     SAFE_CAST(oi.sp AS NUMERIC) AS sp_num,

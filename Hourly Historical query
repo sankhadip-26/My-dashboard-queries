@@ -1,4 +1,3 @@
-
 WITH date_range AS (
   SELECT
     DATE_TRUNC(
@@ -20,11 +19,13 @@ base AS (
     pb.name AS brand,
 
     CASE
-      WHEN UPPER(TRIM(nt.division)) = 'APPAREL' THEN
-        COALESCE(
-          NULLIF(UPPER(TRIM(pt.gender)), ''),
-          'UNKNOWN'
-        )
+      WHEN UPPER(TRIM(nt.division)) IN ('ETHNIC', 'APPAREL') THEN
+        CASE
+          WHEN STARTS_WITH(UPPER(TRIM(nt.gender)), 'M') THEN 'MEN'
+          WHEN STARTS_WITH(UPPER(TRIM(nt.gender)), 'W') THEN 'WOMEN'
+          WHEN STARTS_WITH(UPPER(TRIM(nt.gender)), 'U') THEN 'UNISEX'
+          ELSE 'UNKNOWN'
+        END
       ELSE 'ALL'
     END AS gender,
 
